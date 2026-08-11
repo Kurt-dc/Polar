@@ -15,9 +15,9 @@ import java.util.UUID
  * UUID перенесены из веб-версии приложения (подтверждены Polar BLE SDK
  * и независимыми reverse-engineering проектами):
  *   HR service:        0000180d-0000-1000-8000-00805f9b34fb
- *   PMD service:        fb005c80-02e7-f387-1cad-8acd2d8df0c8
- *   PMD control point:  fb005c81-02e7-f387-1cad-8acd2d8df0c8
- *   PMD data:           fb005c82-02e7-f387-1cad-8acd2d8df0c8
+ *   PMD service:       fb005c80-02e7-f387-1cad-8acd2d8df0c8
+ *   PMD control point: fb005c81-02e7-f387-1cad-8acd2d8df0c8
+ *   PMD data:          fb005c82-02e7-f387-1cad-8acd2d8df0c8
  */
 object PolarUuids {
     val HR_SERVICE: UUID = UUID.fromString("0000180d-0000-1000-8000-00805f9b34fb")
