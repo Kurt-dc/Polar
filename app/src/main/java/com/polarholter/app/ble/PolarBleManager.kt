@@ -1,24 +1,19 @@
 package com.polarholter.app.ble
 
 import android.annotation.SuppressLint
-import android.bluetooth.*
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.os.Build
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import java.util.UUID
 
-/**
- * Тонкая обёртка над Android BLE API для подключения к Polar H10 и работы
- * с сервисом PMD (потоковая ЭКГ) + стандартным Heart Rate Service.
- *
- * UUID перенесены из веб-версии приложения (подтверждены Polar BLE SDK
- * и независимыми reverse-engineering проектами):
- *   HR service:        0000180d-0000-1000-8000-00805f9b34fb
- *   PMD service:       fb005c80-02e7-f387-1cad-8acd2d8df0c8
- *   PMD control point: fb005c81-02e7-f387-1cad-8acd2d8df0c8
- *   PMD data:          fb005c82-02e7-f387-1cad-8acd2d8df0c8
- */
 object PolarUuids {
     val HR_SERVICE: UUID = UUID.fromString("0000180d-0000-1000-8000-00805f9b34fb")
     val HR_MEASUREMENT: UUID = UUID.fromString("00002a37-0000-1000-8000-00805f9b34fb")
@@ -29,8 +24,7 @@ object PolarUuids {
 
     val CLIENT_CHAR_CONFIG: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
-    // Команда запуска потока ЭКГ (130 Гц, диапазон 0.4 мВ), формат подтверждён
-    // тем же байтовым протоколом, что использовался в веб-версии.
+    // Команда запуска потока ЭКГ (130 Гц, диапазон 0.4 мВ)
     val ECG_START_CMD = byteArrayOf(
         0x02, 0x00, 0x00, 0x01, 0x82.toByte(), 0x00, 0x01, 0x01, 0x0E, 0x00
     )
@@ -55,7 +49,6 @@ class PolarBleManager(private val context: Context) {
     private val _events = MutableSharedFlow<BleEvent>(extraBufferCapacity = 64)
     val events = _events.asSharedFlow()
 
-    /** device: результат сканирования, отфильтрованный по имени "Polar H10 ..." */
     fun connect(device: BluetoothDevice) {
         gatt = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
     }
@@ -67,7 +60,9 @@ class PolarBleManager(private val context: Context) {
             if (g != null && c != null) {
                 writeCharacteristicCompat(g, c, PolarUuids.ECG_STOP_CMD, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            // Игнорируем ошибку при отключении
+        }
         gatt?.disconnect()
         gatt?.close()
         gatt = null
@@ -88,7 +83,7 @@ class PolarBleManager(private val context: Context) {
                 _events.tryEmit(BleEvent.Error("Ошибка обнаружения сервисов: $status"))
                 return
             }
-            // Подписка на стандартный Heart Rate (для отображения ЧСС когда ECG-поток выключен)
+            // Подписка на стандартный Heart Rate
             g.getService(PolarUuids.HR_SERVICE)
                 ?.getCharacteristic(PolarUuids.HR_MEASUREMENT)
                 ?.let { enableNotify(g, it) }
@@ -99,13 +94,10 @@ class PolarBleManager(private val context: Context) {
             pmd?.getCharacteristic(PolarUuids.PMD_DATA)?.let { enableNotify(g, it) }
         }
 
-        // API 33+: новая сигнатура с явным value (не зависит от мутируемого characteristic.value).
         override fun onCharacteristicChanged(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
             routeCharacteristicValue(characteristic.uuid, value)
         }
 
-        // До API 33 система вызывает именно этот, двухаргументный колбэк.
-        // Без него на Android 8–12 ЭКГ-поток и ЧСС молча не доходили бы до анализатора.
         @Suppress("DEPRECATION")
         override fun onCharacteristicChanged(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
@@ -147,11 +139,6 @@ class PolarBleManager(private val context: Context) {
         }
     }
 
-    /**
-     * writeCharacteristic(characteristic, value, writeType) — новая сигнатура с API 33.
-     * На более старых устройствах (входят в minSdk 26) этого метода не существует,
-     * нужен старый путь через characteristic.value + writeCharacteristic(characteristic).
-     */
     private fun writeCharacteristicCompat(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray, writeType: Int) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             g.writeCharacteristic(c, value, writeType)
@@ -188,13 +175,11 @@ class PolarBleManager(private val context: Context) {
         _events.tryEmit(BleEvent.HeartRate(bpm))
     }
 
-    /**
-     * Разбор PMD data-кадра для ECG.
-     * Формат кадра Polar PMD: [measType(1)][timestamp(8)][frameType(1)][samples...]
-     * measType == 0x00 -> ECG; frameType == 0x00 -> "сырые" 24-битные little-endian отсчёты, мкВ.
-     */
+    // Разбор PMD data-кадра для ECG:
+    // Формат: measType(1) + timestamp(8) + frameType(1) + samples...
+    // measType == 0x00 -> ECG; frameType == 0x00 -> 24-битные LE отсчеты, мкВ.
     private fun parsePmdEcgFrame(data: ByteArray) {
-        if (data.isEmpty() || data[0].toInt() != 0x00) return // интересует только тип ECG
+        if (data.isEmpty() || data[0].toInt() != 0x00) return
         if (data.size < 10) return
         val frameType = data[9].toInt()
         if (frameType != 0x00) return
